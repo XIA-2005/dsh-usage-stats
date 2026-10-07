@@ -1,0 +1,67 @@
+{
+  "name": "@dsh-external/dsh-usage-stats",
+  "version": "0.0.1",
+  "description": "DSH 用量与工具调用统计（token 分桶、费用估算、工具调用次数排行榜、按天趋势）",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XIA-2005/dsh-usage-stats.git"
+  },
+  "homepage": "https://github.com/XIA-2005/dsh-usage-stats#readme",
+  "bugs": {
+    "url": "https://github.com/XIA-2005/dsh-usage-stats/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "usage",
+    "statistics",
+    "tokens",
+    "tool-calls"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
+    "cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.0.1-rc <2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0",
+    "tsdown": "^0.22.14"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:client": "tsdown"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}
