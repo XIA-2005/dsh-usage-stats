@@ -116,6 +116,18 @@ export interface LedgerState {
   models: Record<string, ModelStat>
   /** 会话 id → 游标。 */
   sessions: Record<string, SessionCursor>
+  /**
+   * 天 × 模型明细：`YYYY-MM-DD` → 模型名 → 统计。
+   *
+   * 面板的「按模型」饼图与选中日期后的联动需要它。只保留最近
+   * {@link DETAIL_KEEP_DAYS} 天，超出由 {@link pruneDetail} 删除；
+   * 天汇总 `days` 则永久保留。
+   */
+  dayModels: Record<string, Record<string, ModelStat>>
+  /** 天 × 工具明细：`YYYY-MM-DD` → 工具名 → { calls, ms }。 */
+  dayTools: Record<string, Record<string, ToolStat>>
+  /** 天 × 会话明细：`YYYY-MM-DD` → 会话 id → 用量。 */
+  daySessions: Record<string, Record<string, UsageTotals>>
   backfill: BackfillState
 }
 
@@ -124,6 +136,14 @@ export const LEDGER_VERSION = 1
 
 /** 失败会话 id 的保留条数。 */
 export const FAILED_KEEP = 20
+
+/**
+ * 按天明细（dayModels / dayTools / daySessions）的保留天数。
+ *
+ * 天汇总 `days` 永久保留；明细按天增长（实测约 3–5 KB/天），120 天约 0.5 MB，
+ * 足够覆盖交互式图表的常用窗口，又不会让账本无限膨胀。
+ */
+export const DETAIL_KEEP_DAYS = 120
 
 /** 折叠所需的事件最小结构（SessionEvent 满足它）。 */
 export interface FoldEvent {
@@ -168,6 +188,9 @@ export function emptyState(): LedgerState {
     days: {},
     models: {},
     sessions: {},
+    dayModels: {},
+    dayTools: {},
+    daySessions: {},
     backfill: { done: false, scanned: 0, total: 0, errors: 0, running: false, failedSessions: [] },
   }
 }
@@ -188,6 +211,9 @@ export function resetState(state: LedgerState): void {
   state.days = {}
   state.models = {}
   state.sessions = {}
+  state.dayModels = {}
+  state.dayTools = {}
+  state.daySessions = {}
   state.backfill = fresh.backfill
 }
 
@@ -199,6 +225,52 @@ export function resetState(state: LedgerState): void {
 export function dayKey(ms: number): string {
   if (!Number.isFinite(ms)) return 'unknown'
   return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 10)
+}
+
+/**
+ * 裁剪过期的按天明细（天汇总 `days` 不受影响）。
+ *
+ * 明细是「天 × 维度」的嵌套字典，按天线性增长。日历日键 `YYYY-MM-DD` 的
+ * 字典序等价于时间序，因此这里直接用字符串比较丢弃早于
+ * `now - DETAIL_KEEP_DAYS` 的整日条目。
+ * @param state - 账本状态（就地裁剪）。
+ * @param now - 当前时刻（epoch 毫秒）。
+ * @returns 被删除的天条目数（三个明细表合计）。
+ */
+export function pruneDetail(state: LedgerState, now: number): number {
+  const cutoff = dayKey(now - DETAIL_KEEP_DAYS * 86_400_000)
+  let removed = 0
+  for (const table of [state.dayModels, state.dayTools, state.daySessions]) {
+    for (const key of Object.keys(table)) {
+      if (key < cutoff) {
+        delete table[key]
+        removed += 1
+      }
+    }
+  }
+  return removed
+}
+
+/**
+ * 统计「有当日汇总、却没有任何按天明细」的天数。
+ *
+ * 按天明细是后加维度，插件升级后**当天就会立刻产生新明细**，因此不能用
+ * 「明细表是否为空」判断历史缺失（会被当天的实时明细掩盖）—— 必须逐日比对。
+ * @param state - 账本。
+ * @returns 缺明细的天数（0 表示明细完整）。
+ */
+export function countDaysMissingDetail(state: LedgerState): number {
+  let missing = 0
+  for (const key of Object.keys(state.days)) {
+    if (
+      state.dayModels[key] === undefined &&
+      state.dayTools[key] === undefined &&
+      state.daySessions[key] === undefined
+    ) {
+      missing += 1
+    }
+  }
+  return missing
 }
 
 /**
@@ -307,8 +379,12 @@ export function applyEvent(
       stat.calls += 1
       state.totals.toolCalls += 1
       cursor.toolCalls = (cursor.toolCalls ?? 0) + 1
-      const day = (state.days[dayKey(ms)] ??= emptyDay())
+      const date = dayKey(ms)
+      const day = (state.days[date] ??= emptyDay())
       day.toolCalls += 1
+      // 天 × 工具：饼图「按工具」的按天数据源（耗时在 tool/result 侧累加）。
+      const dayTool = ((state.dayTools[date] ??= {})[name] ??= { calls: 0, ms: 0 })
+      dayTool.calls += 1
       const callId = data.callId
       if (callId !== undefined && callId !== null) {
         const table = pendingFor(pending, sessionId)
@@ -328,8 +404,12 @@ export function applyEvent(
       const dispatched = table?.get(callId)
       if (table === undefined || dispatched === undefined) break
       table.delete(callId)
+      const elapsed = Math.max(0, ms - dispatched.time)
       const stat = (state.tools[dispatched.name] ??= { calls: 0, ms: 0 })
-      stat.ms += Math.max(0, ms - dispatched.time)
+      stat.ms += elapsed
+      // 耗时归到 result 事件当日，与全局 tools.ms 完全同口径。
+      const dayTool = ((state.dayTools[dayKey(ms)] ??= {})[dispatched.name] ??= { calls: 0, ms: 0 })
+      dayTool.ms += elapsed
       break
     }
     case 'assistant/message': {
@@ -348,12 +428,19 @@ export function applyEvent(
         ms,
       )
       addUsage(state.totals, input, cacheRead, cacheWrite, output, cost)
-      const day = (state.days[dayKey(ms)] ??= emptyDay())
+      const date = dayKey(ms)
+      const day = (state.days[date] ??= emptyDay())
       addUsage(day, input, cacheRead, cacheWrite, output, cost)
       day.modelCalls += 1
       const stat = (state.models[model] ??= { ...emptyUsage(), calls: 0 })
       stat.calls += 1
       addUsage(stat, input, cacheRead, cacheWrite, output, cost)
+      // 天 × 模型：饼图「按模型」的按天数据源。
+      const dayModel = ((state.dayModels[date] ??= {})[model] ??= { ...emptyUsage(), calls: 0 })
+      dayModel.calls += 1
+      addUsage(dayModel, input, cacheRead, cacheWrite, output, cost)
+      // 天 × 会话：选中某日时回答「那天是哪些对话在用」。
+      addUsage(((state.daySessions[date] ??= {})[sessionId] ??= emptyUsage()), input, cacheRead, cacheWrite, output, cost)
       // 会话自身的用量：用于回答「哪个对话最贵」。
       addUsage((cursor.usage ??= emptyUsage()), input, cacheRead, cacheWrite, output, cost)
       cursor.modelCalls = (cursor.modelCalls ?? 0) + 1

@@ -21,15 +21,21 @@ import path from 'node:path'
 
 import { backfill, scanSession, type PersistenceLike } from './backfill.js'
 import {
+  DETAIL_KEEP_DAYS,
   applyEvent,
+  countDaysMissingDetail,
   cursorOf,
   dayKey,
   emptyDay,
   emptyUsage,
+  pruneDetail,
   resetState,
   type DayStat,
   type LedgerState,
+  type ModelStat,
   type PendingCalls,
+  type ToolStat,
+  type UsageTotals,
 } from './fold.js'
 import { LedgerStore, loadLedger } from './ledger.js'
 
@@ -100,15 +106,81 @@ function intParam(url: URL, key: string, fallback: number, min: number, max: num
   return Math.min(max, Math.max(min, value))
 }
 
-/** 生成近 N 天序列（含今天；缺失日补零），按时间升序。 */
-function recentDays(state: LedgerState, count: number, now: number): DayView[] {
+/**
+ * 生成趋势序列，按时间升序。
+ * @param state - 账本。
+ * @param range - 天数；`'all'` 表示账本里**实际有数据**的全部日历日（不补零）。
+ * @param now - 当前时刻（epoch 毫秒）。
+ * @returns 面板柱状图使用的日序列。
+ */
+function trendDays(state: LedgerState, range: number | 'all', now: number): DayView[] {
+  if (range === 'all') {
+    return Object.keys(state.days)
+      .sort()
+      .map((key) => ({ date: key, ...state.days[key] }))
+  }
   const out: DayView[] = []
-  for (let offset = count - 1; offset >= 0; offset -= 1) {
+  for (let offset = range - 1; offset >= 0; offset -= 1) {
     const key = dayKey(now - offset * 86_400_000)
     const day = state.days[key]
     out.push(day === undefined ? { date: key, ...emptyDay() } : { date: key, ...day })
   }
   return out
+}
+
+/**
+ * 读取并校验 `YYYY-MM-DD` 查询参数。
+ * @param url - 请求 URL。
+ * @param key - 参数名。
+ * @returns 合法日期串；缺失或格式错误时为 undefined。
+ */
+function dateParam(url: URL, key: string): string | undefined {
+  const raw = url.searchParams.get(key)
+  if (raw === null || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return undefined
+  return raw
+}
+
+/** 明细端点里工具 / 会话列表的条数上限。 */
+const DETAIL_TOP = 20
+
+/**
+ * 生成某日期区间的按天明细（交互式饼图与「选中某日」联动的数据源）。
+ *
+ * 只返回**实际有数据**的日期；工具与会话各取 Top {@link DETAIL_TOP}
+ * （按次数 / 按费用），模型通常只有个位数因此全量返回。
+ * @param state - 账本。
+ * @param from - 起始日历日（含），`YYYY-MM-DD`。
+ * @param to - 结束日历日（含）。
+ * @param dshHome - DSH 主目录（用于读会话标题）。
+ * @returns 明细视图。
+ */
+function detailView(state: LedgerState, from: string, to: string, dshHome: string): unknown {
+  const dates = new Set<string>()
+  for (const table of [state.dayModels, state.dayTools, state.daySessions]) {
+    for (const key of Object.keys(table)) if (key >= from && key <= to) dates.add(key)
+  }
+  const days = [...dates].sort().map((date) => {
+    const models: Array<{ model: string } & ModelStat> = Object.entries(state.dayModels[date] ?? {})
+      .map(([model, stat]) => ({ model, ...stat }))
+      .sort((left, right) => right.costCny - left.costCny)
+    const tools: Array<{ name: string } & ToolStat> = Object.entries(state.dayTools[date] ?? {})
+      .map(([name, stat]) => ({ name, calls: stat.calls, ms: Math.round(stat.ms) }))
+      .sort((left, right) => right.calls - left.calls || right.ms - left.ms)
+      .slice(0, DETAIL_TOP)
+    const sessions: Array<{ id: string; title: string | null; origin: string; usage: UsageTotals }> = Object.entries(
+      state.daySessions[date] ?? {},
+    )
+      .map(([id, usage]) => ({
+        id,
+        title: readSessionTitle(dshHome, id) ?? null,
+        origin: state.sessions[id]?.origin ?? 'root',
+        usage,
+      }))
+      .sort((left, right) => right.usage.costCny - left.usage.costCny)
+      .slice(0, DETAIL_TOP)
+    return { date, models, tools, sessions }
+  })
+  return { ok: true, from, to, days }
 }
 
 /** 会话标题缓存：避免每次轮询都读盘。 */
@@ -149,7 +221,8 @@ function readSessionTitle(dshHome: string, sessionId: string): string | undefine
 function summaryView(
   state: LedgerState,
   options: {
-    days: number
+    /** 趋势窗口：天数，或 `'all'`（账本里有数据的全部日期）。 */
+    range: number | 'all'
     top: number
     now: number
     dshHome: string
@@ -159,6 +232,7 @@ function summaryView(
   },
 ): unknown {
   const totalCalls = state.totals.toolCalls
+  const detailMissingDays = countDaysMissingDetail(state)
   const ranked = Object.entries(state.tools)
     .map(([toolName, stat]) => ({ name: toolName, calls: stat.calls, ms: Math.round(stat.ms) }))
     .sort((left, right) => right.calls - left.calls || right.ms - left.ms)
@@ -192,7 +266,7 @@ function summaryView(
     models,
     sessions,
     toolKinds: ranked.length,
-    days: recentDays(state, options.days, options.now),
+    days: trendDays(state, options.range, options.now),
     backfill: state.backfill,
     meta: {
       persistenceAvailable: options.persistenceAvailable,
@@ -200,6 +274,10 @@ function summaryView(
       writeError: options.writeError ?? null,
       updatedAt: state.updatedAt,
       sessionCount: Object.keys(state.sessions).length,
+      // 按天明细是后加的字段：老账本里没有，需要提示用户点一次「重建统计」。
+      // 用逐日比对而非「明细表是否为空」，否则升级当天的实时明细会掩盖历史缺失。
+      detailMissingDays,
+      detailMissing: state.totals.sessions > 0 && detailMissingDays > 0,
     },
   }
 }
@@ -336,6 +414,23 @@ export function apply(ctx: HostContext): void {
     void requestScan({ onlyMissing: !first, rebuild: false }).promise
   }, 0).unref?.()
 
+  // ---- 按天明细裁剪 -----------------------------------------------------
+  // 明细随天增长；定期丢弃超过 DETAIL_KEEP_DAYS 的部分（天汇总 days 永久保留）。
+  ctx.effect(
+    () => {
+      const timer = setInterval(() => {
+        const removed = pruneDetail(store.state, Date.now())
+        if (removed > 0) {
+          store.touch()
+          log(`已裁剪 ${removed} 个过期按天明细条目（保留最近 ${DETAIL_KEEP_DAYS} 天）`)
+        }
+      }, 10 * 60_000)
+      timer.unref?.()
+      return () => clearInterval(timer)
+    },
+    'usage-stats: prune daily details',
+  )
+
   // ---- HTTP API ---------------------------------------------------------
   ctx.effect(
     () =>
@@ -348,13 +443,15 @@ export function apply(ctx: HostContext): void {
               const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
               const route = url.pathname.startsWith(API_PREFIX) ? url.pathname.slice(API_PREFIX.length) : url.pathname
               if (route === '' || route === '/' || route === '/summary') {
-                const days = intParam(url, 'days', DEFAULT_DAYS, 1, 120)
+                // range=all 表示全部时间；否则按天数（上限放宽到 400，覆盖 90 天档与更长窗口）。
+                const range: number | 'all' =
+                  url.searchParams.get('range') === 'all' ? 'all' : intParam(url, 'days', DEFAULT_DAYS, 1, 400)
                 const top = intParam(url, 'top', DEFAULT_TOP, 1, 200)
                 sendJson(
                   res,
                   200,
                   summaryView(store.state, {
-                    days,
+                    range,
                     top,
                     now: Date.now(),
                     dshHome,
@@ -363,6 +460,14 @@ export function apply(ctx: HostContext): void {
                     writeError: store.lastError,
                   }),
                 )
+                return
+              }
+              if (route === '/days') {
+                // 明细按需拉取（不进主轮询）：交互流畅，又不让 3 秒轮询背上几十 KB。
+                const now = Date.now()
+                const to = dateParam(url, 'to') ?? dayKey(now)
+                const from = dateParam(url, 'from') ?? dayKey(now - 13 * 86_400_000)
+                sendJson(res, 200, detailView(store.state, from, to, dshHome))
                 return
               }
               if (route === '/rescan') {

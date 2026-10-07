@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-usage-stats",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "DSH 用量与工具调用统计（token 分桶、费用估算、工具调用次数排行榜、按天趋势）",
   "private": true,
   "type": "module",

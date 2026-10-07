@@ -109,6 +109,45 @@ function models(raw: unknown): Record<string, ModelStat> {
   return out
 }
 
+/**
+ * 规整「天 → 子表」两层嵌套结构（按天明细表通用）。
+ *
+ * 任一层不是对象即整条跳过：按天明细是**后加的字段**，老账本里根本没有，
+ * 这里必须容错成空表而不是让整个账本判定为损坏。
+ * @param raw - 任意 JSON 值。
+ * @param map - 叶子对象的规整函数。
+ * @returns 合法的两层表。
+ */
+function mapDays<T>(raw: unknown, map: (value: Record<string, unknown>) => T): Record<string, Record<string, T>> {
+  const out: Record<string, Record<string, T>> = {}
+  if (raw === null || typeof raw !== 'object') return out
+  for (const [date, dayValue] of Object.entries(raw as Record<string, unknown>)) {
+    if (date === '' || dayValue === null || typeof dayValue !== 'object') continue
+    const inner: Record<string, T> = {}
+    for (const [key, value] of Object.entries(dayValue as Record<string, unknown>)) {
+      if (key === '' || value === null || typeof value !== 'object') continue
+      inner[key] = map(value as Record<string, unknown>)
+    }
+    out[date] = inner
+  }
+  return out
+}
+
+/** 规整天 × 模型表。 */
+function dayModels(raw: unknown): Record<string, Record<string, ModelStat>> {
+  return mapDays(raw, (stat) => ({ ...usage(stat), calls: num(stat.calls) }))
+}
+
+/** 规整天 × 工具表。 */
+function dayTools(raw: unknown): Record<string, Record<string, ToolStat>> {
+  return mapDays(raw, (stat) => ({ calls: num(stat.calls), ms: num(stat.ms) }))
+}
+
+/** 规整天 × 会话表。 */
+function daySessions(raw: unknown): Record<string, Record<string, UsageTotals>> {
+  return mapDays(raw, (stat) => usage(stat))
+}
+
 /** 规整会话游标表；丢弃没有有效 id 或负游标的行。 */
 function sessions(raw: unknown): Record<string, SessionCursor> {
   const out: Record<string, SessionCursor> = {}
@@ -166,6 +205,9 @@ export function normalizeLedger(raw: unknown): LedgerState {
     days: days(value.days),
     models: models(value.models),
     sessions: sessions(value.sessions),
+    dayModels: dayModels(value.dayModels),
+    dayTools: dayTools(value.dayTools),
+    daySessions: daySessions(value.daySessions),
     backfill: backfill(value.backfill),
   }
 }

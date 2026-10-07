@@ -28,8 +28,22 @@ npm run build:client         # client：tsdown → lib/client.js
 | 工具调用排行 | Top N（默认 12）：调用次数、占比条、按 `tool/call → tool/result` 配对的累计耗时 |
 | 按模型 | 每个模型的调用次数、缓存读、输出、费用 —— 也是费用口径的自证（Pro 档单价为基价 3 倍） |
 | 最贵的对话 | 按估算费用降序的会话排行（标题 / 创建日 / tokens / 费用），直接回答「钱花在哪个对话上」 |
-| 近 14 天趋势 | 每日 token 柱状图（hover 显示当日 token / 费用 / 工具次数 / 模型调用次数） |
-| 操作 | 刷新、增量扫描（补齐新会话）、重建统计（清空账本从头重放） |
+| **用量趋势（可交互）** | 7 / 14 / 30 / 90 天 / 全部 窗口切换；柱子 hover 出浮层，**点击选中某天**（再点取消） |
+| **构成分析（交互饼图）** | 环形图 4 个维度：token 构成 / 按模型 / 按工具 / 按对话；hover 扇区外移高亮 + 环心显示占比，点图例可隐藏某项 |
+| 操作 | 刷新、增量扫描、重建统计（清空账本从头重放） |
+
+**点柱子选中某天 → 全板块联动**：总览卡片、token 构成、三张表、饼图全部切到那一天，顶部出现「已选
+2026-08-15 ✕」可一键取消；柱状图该柱高亮。选中态、窗口、饼图维度、图例开关都会在 3 秒轮询刷新后保持。
+
+## 交互式图表
+
+- **窗口**：7 / 14 / 30 / 90 天 / 全部（`全部` = 账本里所有有数据的日期，卡片与表格也随之切换口径）。
+- **环形图**：hover 时被指扇区沿角平分线外移、其余降到 35% 透明度，环心显示「名称 / 占比 · 数值」；
+  点击图例项隐藏/显示该扇区（隐藏状态按维度分别记忆）。
+- **四个维度的取值口径**：token 构成 = 四桶互斥计数；按模型 = 该视角下各模型的**估算费用**；
+  按工具 = **调用次数**（取前 8，其余并入「其他」）；按对话 = **费用**（取前 6，其余并入「其他」）。
+- **实现**：纯 DOM + 手写 SVG（`src/client/chart.ts`），**不引入任何图表库** —— client bundle 由 tsdown
+  打进 `lib/client.js`，第三方图表库会让体积成倍增长，而这里只需要一根柱子和一段圆弧。
 
 ## 数据来源与统计口径
 
@@ -47,6 +61,8 @@ npm run build:client         # client：tsdown → lib/client.js
 - **费用为估算**：`cacheRead × 命中价 + (未缓存输入 + 缓存写入) × 未命中价 + 输出 × 输出价`，
   峰谷按**事件自身时间戳**判定（工作日北京时间 9–12 点、14–18 点为峰时；2026-08-23 起周末全天谷价），
   因此历史回填也能还原当时的时段价。单价表集中在 `src/pricing.ts`，调价只改该文件，然后点「重建统计」。
+- **按天明细**（天 × 模型 / 天 × 工具 / 天 × 会话）在折叠时一并写入，是交互式饼图与「选中某天」的数据源；
+  只保留最近 120 天（`DETAIL_KEEP_DAYS`），更早的只留天汇总 `days`。
 - **子代理会话**计入总量（它们真实消耗 token）。
 - **去重**：每个会话维护 `consumedSeq` 游标，实时链路与回填路径在折叠前统一做 `seq < consumedSeq` 跳过，
   因此两条路径重叠工作也只计一次；注入发生在会话中途时（`seq` 跳跃）会自动补齐缺口。
@@ -74,6 +90,8 @@ npm run build:client         # client：tsdown → lib/client.js
   （仅影响极少数跨重启的长任务耗时，次数计数不受影响）。
 - 账本损坏时自动备份为 `.dsh-usage-stats.corrupt-<时间戳>.json` 并从零重建。
 - 单价为公开定价的估算值，**以官方账单为准**。
+- **按天明细不追溯**：`dayModels` / `dayTools` / `daySessions` 是 v0.1.0 新增维度，历史不会自动补算 ——
+  面板会提示「按天明细缺失 N 天」，点一次「重建统计」即可补齐（重放全部会话，约 30 秒）。
 
 ## 账本
 
@@ -87,6 +105,9 @@ npm run build:client         # client：tsdown → lib/client.js
               "outputTokens": 0, "costCny": 0, "sessions": 0, "turns": 0, "steps": 0, "toolCalls": 0 },
   "tools":  { "<工具名>": { "calls": 0, "ms": 0 } },
   "days":   { "YYYY-MM-DD": { /* 四桶 + costCny + toolCalls + modelCalls */ } },
+  "dayModels":   { "YYYY-MM-DD": { "<模型名>": { /* 四桶 + costCny + calls */ } } },
+  "dayTools":    { "YYYY-MM-DD": { "<工具名>": { "calls": 0, "ms": 0 } } },
+  "daySessions": { "YYYY-MM-DD": { "<会话 id>": { /* 四桶 + costCny */ } } },
   "models": { "<模型名>": { /* 四桶 + costCny + calls */ } },
   "sessions": { "<会话 id>": { "consumedSeq": 0, "cwd": "...", "lastTurn": 0, "origin": "root",
                                "usage": { /* 四桶 + costCny */ }, "modelCalls": 0, "toolCalls": 0 } },
@@ -99,6 +120,11 @@ npm run build:client         # client：tsdown → lib/client.js
 前缀 `/dsh-usage-stats/api`（由插件在 host 侧注册）：
 
 - `GET /summary?days=14&top=12` → `{ ok, generatedAt, totals, tools[], models[], sessions[], toolKinds, days[], backfill, meta }`
+  - `days` 上限 400；`range=all` 返回账本里**所有有数据的日期**（不补零）
+  - `meta.detailMissing` / `meta.detailMissingDays`：有当日汇总却缺明细的天数（升级后提示重建用）
+- `GET /days?from=YYYY-MM-DD&to=YYYY-MM-DD` → 按天明细
+  `{ ok, from, to, days[{ date, models[], tools[], sessions[] }] }`（工具/会话各取 Top 20）。
+  面板只在窗口或选中日期变化时按需拉取（60 秒节流），**不跟 3 秒主轮询**。
 - `POST /rescan` → 增量扫描（补齐账本中尚无记录的会话）
 - `POST /rescan?rebuild=1` → 清空账本后从头重放（改定价 / 新增统计维度后使用）
 
@@ -123,3 +149,10 @@ npm run build:client                         # client：tsdown → lib/client.js
 - 注入器的预检用字面形态 `register({` 校验 slot 名，写成 `register(\n  {` 会被误判为「缺合法 name」而阻断注入。
 - host 侧**不 import 任何 `@deepseek-ai/*` 值**（只用 `ctx` 取服务），因此不依赖 profile 里的包解析，
   任何 profile 下都不会因缺依赖而挂起；`sessionPersistence` 缺失时自动降级为「仅统计本次启动后的数据」。
+- SVG 扇区做 hover 放大要用 `translate`（沿角平分线外移），**不要用 `scale`** —— SVG 元素默认以用户
+  坐标系原点为变换基准，直接缩放会让扇区飞出可视区；环心文本用绝对定位 HTML 覆盖层，比 `<text>` 好排版。
+- 单个扇区占 100% 时不能用单段 `A` 弧（起终点重合会不渲染），要走两段半弧。
+- 交互状态（窗口 / 选中日期 / 饼图维度 / 图例开关）必须存在组件闭包里：3 秒轮询会重绘 DOM，
+  存在 DOM 或每次重建都会丢。
+- 「明细是否缺失」不能用「明细表是否为空」判断：升级后**当天就会产生新明细**，历史缺失会被掩盖 ——
+  要逐日比对「有汇总但无任何明细」的天数（`countDaysMissingDetail`）。
