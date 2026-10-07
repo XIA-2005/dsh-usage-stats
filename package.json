@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-usage-stats",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 用量与工具调用统计（token 分桶、费用估算、工具调用次数排行榜、按天趋势）",
   "private": true,
   "type": "module",
@@ -61,6 +61,7 @@
     "build:host": "bash scripts/build.sh",
     "build:client": "bash scripts/build-client.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:pricing": "node scripts/test-pricing.mjs",
     "test:gap-fill": "node scripts/test-gap-fill.mjs",
     "verify:share": "node scripts/verify-share.mjs"
   },

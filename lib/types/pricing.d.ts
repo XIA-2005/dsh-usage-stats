@@ -1,8 +1,13 @@
 /**
  * DeepSeek 定价表与峰谷时段判定 —— 仅用于「估算」费用，以官方账单为准。
  *
- * 单价单位：CNY / 百万 token。每档是 [谷时价, 峰时价]。
- * 峰时 = 北京时间工作日 9:00–12:00、14:00–18:00；2026-08-23 起周末全天谷价。
+ * 单价单位：CNY / 百万 token。每档是 [空闲时段价, 高峰时段价]。
+ *
+ * 官方口径（https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ ，2026-10 核对）：
+ * - `deepseek-flash`（DeepSeek-V4.1-Flash）与 `deepseek-v4-pro`（DeepSeek-V4-Pro-0813）；
+ *   旧模型名 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 仍可调用，**按 Flash 价计费**。
+ * - 空闲时段价为高峰时段价的一半；高峰时段 = 北京时间**周一至周五（不含中国法定节假日）**
+ *   9:00–12:00、14:00–18:00，其余时段（含周末与中国法定节假日全天）均为空闲时段。
  *
  * 模型名匹配是**子串**匹配（小写），因此官方名、中转站的别名、带渠道前缀的
  * 名字（如 `apigoto/deepseek-flash`）都能命中。内置规则覆盖不到的名字
@@ -17,7 +22,7 @@
  */
 /** 高峰时段（北京时间、工作日；左闭右开的小时区间）。 */
 export declare const PEAK_HOURS: readonly (readonly [number, number])[];
-/** 一个模型的三档单价：[谷时, 峰时]。 */
+/** 一个模型的三档单价：[空闲时段, 高峰时段]。 */
 export interface PriceTable {
     /** 缓存命中输入（cacheRead）。 */
     readonly hit: readonly [number, number];
@@ -35,15 +40,15 @@ export declare function setPriceOverrides(rules: readonly (readonly [string, Pri
 export declare function priceOverrideCount(): number;
 /** 一次模型名的解析结果。 */
 export interface PriceResolution {
-    /** 生效的价表（未收录时为基价）。 */
+    /** 生效的价表（未收录时为兜底价）。 */
     readonly table: PriceTable;
-    /** 命中的规则子串；`null` = 未收录，当前按基价估算。 */
+    /** 命中的规则子串；`null` = 未收录，当前按兜底价估算。 */
     readonly rule: string | null;
 }
 /**
  * 解析模型名对应的价表，并说明它是否被价表收录。
  *
- * 匹配顺序：外部覆盖规则 → 内置规则 → 基价（`rule: null`）。空名、`(unknown)`
+ * 匹配顺序：外部覆盖规则 → 内置规则 → 兜底价（`rule: null`）。空名、`(unknown)`
  * 等占位模型名同样返回 `rule: null`，让「估算不准」这件事在面板上可见。
  * @param model - 模型名（如 `deepseek-v4-pro`、`deepseek-flash`）。
  * @returns 价表与命中的规则；未收录时规则为 null。
@@ -52,11 +57,11 @@ export declare function resolvePrice(model: unknown): PriceResolution;
 /**
  * 解析模型名对应的价表（只关心价格、不关心是否收录时用它）。
  * @param model - 模型名。
- * @returns 该模型的价表；未收录时返回基价。
+ * @returns 该模型的价表；未收录时返回兜底价（Flash 档）。
  */
 export declare function priceFor(model: unknown): PriceTable;
 /**
- * 模型名是否被子串规则收录（未收录说明费用只是「基价兜底」，不可信）。
+ * 模型名是否被子串规则收录（未收录说明费用只是「兜底价」，不可信）。
  * @param model - 模型名。
  * @returns 命中任一规则时为 true。
  */
@@ -74,11 +79,13 @@ export interface ParsedPriceOverrides {
  * 期望形状（与账本同目录的 `.dsh-usage-stats.prices.json`）：
  * ```jsonc
  * {
- *   "deepseek-flash": { "hit": [0.05, 0.1], "miss": [1.5, 3.0], "out": [4.5, 9.0] },
- *   "apigoto/deepseek-pro": { "hit": [0.15, 0.3], "miss": [4.5, 9.0], "out": [13.5, 27.0] }
+ *   // 官方 deepseek-flash 现价（2026-10）：命中 0.02/0.04、未命中 1/2、输出 4/8
+ *   "deepseek-flash": { "hit": [0.02, 0.04], "miss": [1, 2], "out": [4, 8] },
+ *   // 中转站若与官方不同价，按自己的账单写；键序即优先级
+ *   "apigoto/deepseek-pro": { "hit": [0.15, 0.3], "miss": [4.5, 9], "out": [13.5, 27] }
  * }
  * ```
- * 键是模型名子串（小写匹配），值是该模型的 `[谷时, 峰时]` 三档单价。键序即优先级。
+ * 键是模型名子串（小写匹配），值是该模型的 `[空闲时段价, 高峰时段价]` 三档单价。键序即优先级。
  * 形状不合法的条目被跳过并记入 `problems`，**绝不**让一份坏文件阻断插件加载。
  * @param raw - `JSON.parse` 之后的值（任意）。
  * @returns 可用规则与被跳过的条目说明。
@@ -86,8 +93,12 @@ export interface ParsedPriceOverrides {
 export declare function parsePriceOverrides(raw: unknown): ParsedPriceOverrides;
 /**
  * 判断某一时刻是否处于高峰时段。
+ *
+ * 官方口径：高峰 = 北京时间**周一至周五（不含中国法定节假日）**的 9:00–12:00、
+ * 14:00–18:00；其余时段（含周末与中国法定节假日全天）为空闲时段。
+ * 因此判定顺序是：先看是否落在峰时小时区间内，再排除周末与节假日。
  * @param ms - epoch 毫秒（事件时间戳）。
- * @returns 峰时为 true；非有限值一律 false（按谷价）。
+ * @returns 峰时为 true；非有限值一律 false（按空闲时段价）。
  */
 export declare function isPeak(ms: number): boolean;
 /** 一次模型调用的用量桶（**互斥**计数：billed input = 前三者之和）。 */

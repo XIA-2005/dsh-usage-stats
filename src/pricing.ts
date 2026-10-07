@@ -1,8 +1,13 @@
 /**
  * DeepSeek 定价表与峰谷时段判定 —— 仅用于「估算」费用，以官方账单为准。
  *
- * 单价单位：CNY / 百万 token。每档是 [谷时价, 峰时价]。
- * 峰时 = 北京时间工作日 9:00–12:00、14:00–18:00；2026-08-23 起周末全天谷价。
+ * 单价单位：CNY / 百万 token。每档是 [空闲时段价, 高峰时段价]。
+ *
+ * 官方口径（https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ ，2026-10 核对）：
+ * - `deepseek-flash`（DeepSeek-V4.1-Flash）与 `deepseek-v4-pro`（DeepSeek-V4-Pro-0813）；
+ *   旧模型名 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 仍可调用，**按 Flash 价计费**。
+ * - 空闲时段价为高峰时段价的一半；高峰时段 = 北京时间**周一至周五（不含中国法定节假日）**
+ *   9:00–12:00、14:00–18:00，其余时段（含周末与中国法定节假日全天）均为空闲时段。
  *
  * 模型名匹配是**子串**匹配（小写），因此官方名、中转站的别名、带渠道前缀的
  * 名字（如 `apigoto/deepseek-flash`）都能命中。内置规则覆盖不到的名字
@@ -22,10 +27,53 @@ export const PEAK_HOURS: readonly (readonly [number, number])[] = [
   [14, 18],
 ]
 
-/** 周末全天谷价的生效时刻（epoch 秒）= 北京时间 2026-08-23 00:00。 */
+/**
+ * 「周末全天空闲」的生效时刻（epoch 秒）= 北京时间 2026-08-23 00:00。
+ *
+ * 官方页现在把周末整体列为空闲；这个时间点之前的历史按当时的规则（周末同样有峰谷）
+ * 计价，因此回填历史时不会用新规则改写旧账。
+ */
 const WEEKEND_VALLEY_FROM_SEC = Math.floor(Date.UTC(2026, 7, 22, 16, 0, 0) / 1000)
 
-/** 一个模型的三档单价：[谷时, 峰时]。 */
+/**
+ * 2026 年中国法定节假日（北京时间日历日，全天按空闲时段计价）。
+ *
+ * 来源：国务院办公厅《关于2026年部分节假日安排的通知》（国办发明电〔2025〕7号）。
+ * **只覆盖 2026 年**：表外的年份退回「周一至周五 = 高峰」的规则；官方每年 11 月前后
+ * 公布次年安排，届时把新年份补进来即可（改完点「重建统计」重算）。
+ */
+const HOLIDAYS: ReadonlySet<string> = new Set([
+  // 元旦：1月1日至3日
+  '2026-01-01', '2026-01-02', '2026-01-03',
+  // 春节：2月15日至23日
+  '2026-02-15', '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20', '2026-02-21', '2026-02-22', '2026-02-23',
+  // 清明：4月4日至6日
+  '2026-04-04', '2026-04-05', '2026-04-06',
+  // 劳动节：5月1日至5日
+  '2026-05-01', '2026-05-02', '2026-05-03', '2026-05-04', '2026-05-05',
+  // 端午：6月19日至21日
+  '2026-06-19', '2026-06-20', '2026-06-21',
+  // 中秋：9月25日至27日
+  '2026-09-25', '2026-09-26', '2026-09-27',
+  // 国庆：10月1日至7日
+  '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07',
+])
+
+/**
+ * 2026 年调休上班日（周末但按工作日上班）：1/4、2/14、2/28、5/9、9/20、10/10。
+ *
+ * 官方页把「周末」整体列为空闲时段，但没说清调休上班日怎么算（它名义上是工作日）。
+ * 本插件按官方措辞的**字面**处理：周末一律空闲，调休日也不例外。
+ * 若实际账单显示调休日按高峰计价，把 {@link MAKEUP_WORKDAYS_ARE_PEAK} 改成 true 即可。
+ */
+const MAKEUP_WORKDAYS: ReadonlySet<string> = new Set([
+  '2026-01-04', '2026-02-14', '2026-02-28', '2026-05-09', '2026-09-20', '2026-10-10',
+])
+
+/** 调休上班日是否按高峰时段计价（默认 false = 按官方措辞的字面，周末含调休一律空闲）。 */
+const MAKEUP_WORKDAYS_ARE_PEAK = false
+
+/** 一个模型的三档单价：[空闲时段, 高峰时段]。 */
 export interface PriceTable {
   /** 缓存命中输入（cacheRead）。 */
   readonly hit: readonly [number, number]
@@ -35,35 +83,42 @@ export interface PriceTable {
   readonly out: readonly [number, number]
 }
 
-/** 基价（flash 档）。 */
-const BASE_PRICE: PriceTable = { hit: [0.05, 0.1], miss: [1.5, 3.0], out: [4.5, 9.0] }
-/** Pro 档 = 基价 3 倍。 */
-const PRO_PRICE: PriceTable = { hit: [0.15, 0.3], miss: [4.5, 9.0], out: [13.5, 27.0] }
+/**
+ * Flash 档单价 = 官方 `deepseek-flash`：命中 0.02/0.04、未命中 1/2、输出 4/8。
+ *
+ * 历史教训：这里曾写成 0.05/0.1、1.5/3、4.5/9（整体偏高 1.125–2.5 倍），
+ * 因为缓存命中价被记成 0.05 而不是 0.02，金额因此系统性高估。改价前务必对着
+ * 官方页逐行抄，别按「大概是几倍」推算。
+ */
+const FLASH_PRICE: PriceTable = { hit: [0.02, 0.04], miss: [1, 2], out: [4, 8] }
+
+/**
+ * Pro 档单价 = 官方 `deepseek-v4-pro`：命中 0.15/0.30、未命中 4.5/9、输出 13.5/27。
+ *
+ * **显式写死，不再由 Flash 价乘系数推算**：Pro 相对 Flash 的倍率并不统一
+ * （命中 7.5×、未命中 4.5×、输出 3.375×），任何「按倍数推」的写法迟早会错。
+ */
+const PRO_PRICE: PriceTable = { hit: [0.15, 0.3], miss: [4.5, 9], out: [13.5, 27] }
 
 /**
  * 内置价表规则：模型名子串（小写）→ 价表，**按声明顺序首个命中生效**。
  *
- * 顺序是契约：档位后缀（`-pro` / `-flash`）必须排在其家族前缀（`deepseek-v4`）
- * 之前，否则 Pro 会被家族规则按基价吃掉。已知的官方名与常见中转别名都在这里：
- * 官方 `deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-chat` / `deepseek-reasoner`，
- * 中转站的 `deepseek-flash` / `deepseek-pro` / `deepseek-v3` / `deepseek-r1` 等。
+ * 只收录官方价格页明确列出的模型与官方说明的旧名；官方页已经不再列出的历史名
+ * （`deepseek-chat` / `deepseek-reasoner` / `deepseek-v3` / `deepseek-r1` 等）**故意不收**：
+ * 它们的现价无从核对，宁可让面板报「未收录价表」，也不要给一个看起来正常的假数字
+ * —— 需要用的人可以在单价覆盖文件里自己补。
  */
 const BUILTIN_RULES: readonly (readonly [string, PriceTable])[] = [
-  // 精确到档位的官方名（先于家族规则）
-  ['deepseek-v4-flash-vision-exp', BASE_PRICE],
+  // 官方说明仍可调用、按 Flash 计费的旧名（更长者在前，避免被短规则截胡）
+  ['deepseek-v4-flash-vision-exp', FLASH_PRICE],
+  ['deepseek-v4-flash', FLASH_PRICE],
+  // Pro 档
   ['deepseek-v4-pro', PRO_PRICE],
-  ['deepseek-v4-flash', BASE_PRICE],
-  // 中转 / 别名：deepseek-flash、deepseek-pro、apigoto 等渠道名
   ['deepseek-pro', PRO_PRICE],
-  ['deepseek-flash', BASE_PRICE],
-  // 官方老名与中转别名
-  ['deepseek-chat', BASE_PRICE],
-  ['deepseek-reasoner', BASE_PRICE],
-  ['deepseek-r1', BASE_PRICE],
-  // 家族兜底：只写了主版本号时按基价（Pro 已被上面的规则拦下）
-  ['deepseek-v4', BASE_PRICE],
-  ['deepseek-v3', BASE_PRICE],
+  // 官方当前模型名
+  ['deepseek-flash', FLASH_PRICE],
 ]
+
 
 /** 外部覆盖规则（来自价格覆盖文件），优先于内置规则。 */
 let overrideRules: readonly (readonly [string, PriceTable])[] = []
@@ -83,39 +138,47 @@ export function priceOverrideCount(): number {
 
 /** 一次模型名的解析结果。 */
 export interface PriceResolution {
-  /** 生效的价表（未收录时为基价）。 */
+  /** 生效的价表（未收录时为兜底价）。 */
   readonly table: PriceTable
-  /** 命中的规则子串；`null` = 未收录，当前按基价估算。 */
+  /** 命中的规则子串；`null` = 未收录，当前按兜底价估算。 */
   readonly rule: string | null
 }
 
 /**
+ * 未收录模型的兜底价 = Flash 档。
+ *
+ * 这仍是**猜测**（未知模型可能比 Flash 贵），所以它一定会带 `rule: null`，
+ * 由面板提示「费用仅供参考」；不要指望这个数字准确。
+ */
+const FALLBACK_PRICE = FLASH_PRICE
+
+/**
  * 解析模型名对应的价表，并说明它是否被价表收录。
  *
- * 匹配顺序：外部覆盖规则 → 内置规则 → 基价（`rule: null`）。空名、`(unknown)`
+ * 匹配顺序：外部覆盖规则 → 内置规则 → 兜底价（`rule: null`）。空名、`(unknown)`
  * 等占位模型名同样返回 `rule: null`，让「估算不准」这件事在面板上可见。
  * @param model - 模型名（如 `deepseek-v4-pro`、`deepseek-flash`）。
  * @returns 价表与命中的规则；未收录时规则为 null。
  */
 export function resolvePrice(model: unknown): PriceResolution {
   const name = String(model ?? '').trim().toLowerCase()
-  if (name === '' || name === '(unknown)') return { table: BASE_PRICE, rule: null }
+  if (name === '' || name === '(unknown)') return { table: FALLBACK_PRICE, rule: null }
   for (const [key, table] of overrideRules) if (name.includes(key)) return { table, rule: key }
   for (const [key, table] of BUILTIN_RULES) if (name.includes(key)) return { table, rule: key }
-  return { table: BASE_PRICE, rule: null }
+  return { table: FALLBACK_PRICE, rule: null }
 }
 
 /**
  * 解析模型名对应的价表（只关心价格、不关心是否收录时用它）。
  * @param model - 模型名。
- * @returns 该模型的价表；未收录时返回基价。
+ * @returns 该模型的价表；未收录时返回兜底价（Flash 档）。
  */
 export function priceFor(model: unknown): PriceTable {
   return resolvePrice(model).table
 }
 
 /**
- * 模型名是否被子串规则收录（未收录说明费用只是「基价兜底」，不可信）。
+ * 模型名是否被子串规则收录（未收录说明费用只是「兜底价」，不可信）。
  * @param model - 模型名。
  * @returns 命中任一规则时为 true。
  */
@@ -147,11 +210,13 @@ function pair(value: unknown): readonly [number, number] | undefined {
  * 期望形状（与账本同目录的 `.dsh-usage-stats.prices.json`）：
  * ```jsonc
  * {
- *   "deepseek-flash": { "hit": [0.05, 0.1], "miss": [1.5, 3.0], "out": [4.5, 9.0] },
- *   "apigoto/deepseek-pro": { "hit": [0.15, 0.3], "miss": [4.5, 9.0], "out": [13.5, 27.0] }
+ *   // 官方 deepseek-flash 现价（2026-10）：命中 0.02/0.04、未命中 1/2、输出 4/8
+ *   "deepseek-flash": { "hit": [0.02, 0.04], "miss": [1, 2], "out": [4, 8] },
+ *   // 中转站若与官方不同价，按自己的账单写；键序即优先级
+ *   "apigoto/deepseek-pro": { "hit": [0.15, 0.3], "miss": [4.5, 9], "out": [13.5, 27] }
  * }
  * ```
- * 键是模型名子串（小写匹配），值是该模型的 `[谷时, 峰时]` 三档单价。键序即优先级。
+ * 键是模型名子串（小写匹配），值是该模型的 `[空闲时段价, 高峰时段价]` 三档单价。键序即优先级。
  * 形状不合法的条目被跳过并记入 `problems`，**绝不**让一份坏文件阻断插件加载。
  * @param raw - `JSON.parse` 之后的值（任意）。
  * @returns 可用规则与被跳过的条目说明。
@@ -187,21 +252,39 @@ export function parsePriceOverrides(raw: unknown): ParsedPriceOverrides {
 
 /**
  * 判断某一时刻是否处于高峰时段。
+ *
+ * 官方口径：高峰 = 北京时间**周一至周五（不含中国法定节假日）**的 9:00–12:00、
+ * 14:00–18:00；其余时段（含周末与中国法定节假日全天）为空闲时段。
+ * 因此判定顺序是：先看是否落在峰时小时区间内，再排除周末与节假日。
  * @param ms - epoch 毫秒（事件时间戳）。
- * @returns 峰时为 true；非有限值一律 false（按谷价）。
+ * @returns 峰时为 true；非有限值一律 false（按空闲时段价）。
  */
 export function isPeak(ms: number): boolean {
   if (!Number.isFinite(ms)) return false
   const sec = Math.floor(ms / 1000)
   // 按 UTC 读法读北京日历：偏移 8 小时后 getUTC* 即北京时间字段。
   const beijing = new Date(sec * 1000 + 8 * 3600 * 1000)
-  if (sec >= WEEKEND_VALLEY_FROM_SEC) {
-    const day = beijing.getUTCDay()
-    if (day === 0 || day === 6) return false
-  }
   const hour = beijing.getUTCHours()
-  for (const [start, end] of PEAK_HOURS) if (hour >= start && hour < end) return true
-  return false
+  let inPeakHours = false
+  for (const [start, end] of PEAK_HOURS) {
+    if (hour >= start && hour < end) {
+      inPeakHours = true
+      break
+    }
+  }
+  if (!inPeakHours) return false
+
+  // 法定节假日全天空闲（表只覆盖 2026 年，见 HOLIDAYS）。
+  const dayKey = beijing.toISOString().slice(0, 10)
+  if (HOLIDAYS.has(dayKey)) return false
+
+  const day = beijing.getUTCDay()
+  const weekend = day === 0 || day === 6
+  // 2026-08-23 之前的历史按当时的规则（周末照常分峰谷）计价，避免用新规则改写旧账。
+  if (weekend && sec >= WEEKEND_VALLEY_FROM_SEC) {
+    return MAKEUP_WORKDAYS_ARE_PEAK && MAKEUP_WORKDAYS.has(dayKey)
+  }
+  return true
 }
 
 /** 一次模型调用的用量桶（**互斥**计数：billed input = 前三者之和）。 */
