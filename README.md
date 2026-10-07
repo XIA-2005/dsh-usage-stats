@@ -187,7 +187,16 @@ junction 链接 —— 那正是别人机器上最容易装不上的一环。
 
 注入器环境下：`dev_build_plugin <本目录>` → `dev_inject_plugin <本目录>`（运行时注入，免重启，卸载即净）。
 
-自检：`node scripts/test-gap-fill.mjs`（中途启用不丢历史，见「数据来源与统计口径」）。
+自检（**分享前建议都跑一遍**，两个脚本都只读产物、写在临时 DSH_HOME 里）：
+
+```bash
+npm run verify:share    # 把当前产物当成「别人拿到的东西」：零依赖装载 host + client 激活 + 鉴权围栏 + 单价覆盖
+npm run test:gap-fill   # 中途启用不丢历史（见「数据来源与统计口径」）
+```
+
+`verify:share` 也可以指向别处的副本：`node scripts/verify-share.mjs /path/to/clone`；
+再给第二个参数（旧版产物目录）就会做 A/B，演示「client 未声明 `inject` 时 `apply()` 抛
+TypeError → 前端整页报 `entry did not activate`」这条分享杀手。
 
 > `lib/client/index.js` 是 tsc 的中间产物（类型声明用），**真正的 client 入口是 `lib/client.js`**。
 > `lib/` 是**有意提交**的构建产物：分享出去的形态是 GitHub 仓库，clone 即可注入，对方不需要 DSH 源码

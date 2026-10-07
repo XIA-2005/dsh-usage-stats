@@ -60,7 +60,9 @@
     "build": "bash scripts/build.sh && bash scripts/build-client.sh",
     "build:host": "bash scripts/build.sh",
     "build:client": "bash scripts/build-client.sh",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:gap-fill": "node scripts/test-gap-fill.mjs",
+    "verify:share": "node scripts/verify-share.mjs"
   },
   "exports": {
     ".": {
