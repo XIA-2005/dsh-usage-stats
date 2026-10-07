@@ -8,16 +8,24 @@ DeepSeek Harness 的**用量与工具调用统计**插件：在 Web 设置页新
 
 ## 安装
 
+**仓库里直接带 `lib/` 构建产物** —— clone 下来即可注入，不需要 DSH 源码检出、npm 安装或任何构建步骤：
+
 ```bash
 git clone https://github.com/XIA-2005/dsh-usage-stats.git
-cd dsh-usage-stats
-export DSH_CHECKOUT=/path/to/deepseek-harness   # 需要含 packages/ 与 node_modules/.bin/tsc 的源码检出
-bash scripts/build.sh        # host：link 依赖 + tsc → lib/
-npm run build:client         # client：tsdown → lib/client.js
+# 注入器环境（运行时注入、免重启、卸载即净）：
+#   dev_inject_plugin <本目录>
+# 或走官方装配：
+#   plugin_manager install_bundle <本目录>
 ```
 
-构建完成后，在 DSH 注入器环境里 `dev_build_plugin <本目录>` → `dev_inject_plugin <本目录>`
-即可（运行时注入，免重启，卸载即净）。
+只有改了 `src/` 才需要重新构建；**改完请把 `lib/` 一起提交**，否则别人拉到的是旧代码：
+
+```bash
+npm install --ignore-scripts   # 只装 typescript / @types/node / tsdown（DSH 包是 optional peer，不会去 registry 拉）
+npm run build                  # host: tsc → lib/；client: tsdown → lib/client.js
+```
+
+有 DSH 源码检出时也可以复用它的工具链：`export DSH_CHECKOUT=/path/to/deepseek-harness && npm run build`。
 
 ## 功能
 
@@ -60,12 +68,37 @@ npm run build:client         # client：tsdown → lib/client.js
   计费输入；`reasoningTokens` 已包含在 `outputTokens` 内，**不重复计入**。
 - **费用为估算**：`cacheRead × 命中价 + (未缓存输入 + 缓存写入) × 未命中价 + 输出 × 输出价`，
   峰谷按**事件自身时间戳**判定（工作日北京时间 9–12 点、14–18 点为峰时；2026-08-23 起周末全天谷价），
-  因此历史回填也能还原当时的时段价。单价表集中在 `src/pricing.ts`，调价只改该文件，然后点「重建统计」。
+  因此历史回填也能还原当时的时段价。
+- **模型名按子串匹配，覆盖官方名与常见中转别名**：`deepseek-v4-pro` / `deepseek-v4-flash` /
+  `deepseek-flash` / `deepseek-pro` / `deepseek-chat` / `deepseek-reasoner` / `deepseek-v3` / `deepseek-r1` 等，
+  带渠道前缀（如 `apigoto/deepseek-flash`）同样命中；Pro 档单价是基价的 3 倍。
+- **没被价表收录的模型不再静默按基价**：`/summary` 的 `meta.unpricedModels` 会列出它们，
+  面板顶部直接提示「费用仅供参考」，避免把兜底价当成真实价格。
+- **要接自己的单价**（中转站与官方不同价）：写一份 `%DSH_HOME%/.dsh-usage-stats.prices.json`，
+  覆盖规则优先于内置规则，**不改代码、不重编译**，写好后点一次「重建统计」按新价重算历史：
+
+  ```jsonc
+  {
+    // 键 = 模型名子串（小写匹配），值 = [谷时价, 峰时价] 三档单价（CNY / 百万 token）
+    "deepseek-flash": { "hit": [0.05, 0.1], "miss": [1.5, 3.0], "out": [4.5, 9.0] },
+    "apigoto/deepseek-pro": { "hit": [0.15, 0.3], "miss": [4.5, 9.0], "out": [13.5, 27.0] }
+  }
+  ```
+
+  形状不合法或解析失败**不会阻断插件**：坏条目被跳过、原因进 `meta.priceFileError`，面板照常统计。
+  内置价表的基准是 `src/pricing.ts` 里的 `BUILTIN_RULES`，调价改那里（然后点「重建统计」）。
+
 - **按天明细**（天 × 模型 / 天 × 工具 / 天 × 会话）在折叠时一并写入，是交互式饼图与「选中某天」的数据源；
   只保留最近 120 天（`DETAIL_KEEP_DAYS`），更早的只留天汇总 `days`。
 - **子代理会话**计入总量（它们真实消耗 token）。
 - **去重**：每个会话维护 `consumedSeq` 游标，实时链路与回填路径在折叠前统一做 `seq < consumedSeq` 跳过，
-  因此两条路径重叠工作也只计一次；注入发生在会话中途时（`seq` 跳跃）会自动补齐缺口。
+  因此两条路径重叠工作也只计一次。
+- **中途启用不丢前半段**：注入发生在会话中途时，实时事件的 `seq` 会跳跃（跳过的部分是插件加载前
+  已经写进日志的事件）。此时**先补齐、后折叠**：缺口会话上不再直接折叠实时事件，而是把它们按序
+  缓存，从原游标续读到末尾补齐后再重放（游标去重保证恰好一次）。
+  反过来做（先折叠、再补齐）会把游标推过缺口，补齐路径从新游标开始读，缺口永远补不回来 ——
+  `scripts/test-gap-fill.mjs` 用同一份合成日志对比两种顺序：全量回填与「先补后折」都是
+  `{62 次工具调用, 4 轮, 60 步}`，而「先折后补」只剩 `{4, 0, 0}`。
 
 ## 实测样例：为什么要按对话看（本机）
 
@@ -119,28 +152,46 @@ npm run build:client         # client：tsdown → lib/client.js
 
 前缀 `/dsh-usage-stats/api`（由插件在 host 侧注册）：
 
+**鉴权**：路由复用官方 `ctx.connection.requestRejection`（Host/Origin 围栏 + 浏览器签名 cookie），
+即插件自己注册的路由也过一遍官方 `/api` 通道那套准入 —— 回环地址的外部页面、跨站 `no-cors`
+简单请求都会被 **403**（来源不可信）或 **401**（未通过浏览器鉴权）挡掉。找不到 `connection`
+服务时（非 Web profile）降级为本地 Host/Origin 围栏。面板用 `credentials: 'same-origin'` 取数。
+
 - `GET /summary?days=14&top=12` → `{ ok, generatedAt, totals, tools[], models[], sessions[], toolKinds, days[], backfill, meta }`
   - `days` 上限 400；`range=all` 返回账本里**所有有数据的日期**（不补零）
   - `meta.detailMissing` / `meta.detailMissingDays`：有当日汇总却缺明细的天数（升级后提示重建用）
+  - `meta.unpricedModels`：价表未收录、当前按基价兜底的模型名（费用不可信的自证）
+  - `meta.priceFile` / `meta.priceOverrides` / `meta.priceFileError`：单价覆盖文件的路径、生效条数与错误
 - `GET /days?from=YYYY-MM-DD&to=YYYY-MM-DD` → 按天明细
   `{ ok, from, to, days[{ date, models[], tools[], sessions[] }] }`（工具/会话各取 Top 20）。
   面板只在窗口或选中日期变化时按需拉取（60 秒节流），**不跟 3 秒主轮询**。
 - `POST /rescan` → 增量扫描（补齐账本中尚无记录的会话）
 - `POST /rescan?rebuild=1` → 清空账本后从头重放（改定价 / 新增统计维度后使用）
 
-## 构建与注入
+## 构建、注入与自检
 
 ```bash
-export DSH_CHECKOUT=D:/deepseek-harness     # 需含 packages/ 与 node_modules/.bin/tsc 的源码检出
-bash scripts/build.sh                        # host：link 依赖 + tsc → lib/
-npm run build:client                         # client：tsdown → lib/client.js
+# A. 免检出（推荐）：只用本地 devDependencies
+npm install --ignore-scripts     # typescript / @types/node / tsdown；DSH 包是 optional peer，不会去 registry 拉
+npm run build                    # host + client 一起构建
+
+# B. 有 DSH 源码检出：复用检出里的工具链
+export DSH_CHECKOUT=/path/to/deepseek-harness
+npm run build
 ```
+
+`npm run build` = `scripts/build.sh`（host：`tsc` → `lib/`）+ `scripts/build-client.sh`（client：`tsdown` →
+`lib/client.js`）。两个脚本都先找本地 `node_modules/.bin`，再退回 `$DSH_CHECKOUT`，两条路径都不用额外配置。
+host 源码只 import `node:*`，因此**不再需要**旧版那套 cordis / dsh-tools / dsh-llm / schemastery 的
+junction 链接 —— 那正是别人机器上最容易装不上的一环。
 
 注入器环境下：`dev_build_plugin <本目录>` → `dev_inject_plugin <本目录>`（运行时注入，免重启，卸载即净）。
 
-> 注：`npm run build:client` 需要 tsdown 可解析；若插件目录未装，可直接调用检出里的
-> `<DSH_CHECKOUT>/node_modules/.bin/tsdown`（在插件目录内执行）。
+自检：`node scripts/test-gap-fill.mjs`（中途启用不丢历史，见「数据来源与统计口径」）。
+
 > `lib/client/index.js` 是 tsc 的中间产物（类型声明用），**真正的 client 入口是 `lib/client.js`**。
+> `lib/` 是**有意提交**的构建产物：分享出去的形态是 GitHub 仓库，clone 即可注入，对方不需要 DSH 源码
+> 检出、npm 安装或任何构建（改完 `src/` 记得 `npm run build` 并把 `lib/` 一起提交）。
 
 ## 开发要点（踩过的坑）
 
@@ -156,3 +207,12 @@ npm run build:client                         # client：tsdown → lib/client.js
   存在 DOM 或每次重建都会丢。
 - 「明细是否缺失」不能用「明细表是否为空」判断：升级后**当天就会产生新明细**，历史缺失会被掩盖 ——
   要逐日比对「有汇总但无任何明细」的天数（`countDaysMissingDetail`）。
+- **自己注册的 Web 路由必须自己补鉴权**：`ctx.webServer.register` 绕过官方 `/api` 通道的准入
+  （Host 围栏防 DNS rebinding、`sec-fetch-site`/Origin 防跨站、签名 cookie 防未登录）。插件路由要显式
+  调 `ctx.get('connection').requestRejection({ headers })`，前端 fetch 带上 `credentials: 'same-origin'`；
+  否则任意 loopback 页面都能用 `no-cors` 简单请求 POST 一个 `?rebuild=1` 把账本清空。
+  找不到 `connection` 服务时降级为本地 Host/Origin 围栏（`routeRejection`）。
+- **缺口补齐的顺序不能反**：`applyEvent` 会推进游标，任何「先折叠、后补齐」的写法都会让补齐从新游标
+  开始读，缺口永久丢失。正确做法是缺口会话上先补齐（游标不动）、期间实时事件只入队、补齐后重放。
+- **未收录模型要显式暴露**：静默按基价兜底会把「估算不准」伪装成正常数字 —— 面板必须能看出
+  哪些模型的金额只是兜底（`meta.unpricedModels`），否则费用这一栏就是不可证伪的。

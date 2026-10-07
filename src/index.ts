@@ -4,13 +4,18 @@
  * 职责：
  * 1. 账本：`%DSH_HOME%/.dsh-usage-stats.json`，跨重启累计；
  * 2. 实时：监听 `session/event`，把 tool/call、tool/result、assistant/message、
- *    step/end 折叠进账本（游标去重，seq 跳跃时自动补齐）；
+ *    step/end 折叠进账本（游标去重；seq 跳跃时**先补齐缺口、再折叠**，注入发生在
+ *    会话中途也不会丢前半段）；
  * 3. 回填：首次启用时用官方 `sessionPersistence` 分页读取全部历史会话；
  * 4. 供数：`/dsh-usage-stats/api/summary` 与 `/rescan`，由设置页面板消费。
+ *    路由复用官方 `ctx.connection.requestRejection`（Host/Origin 围栏 + 浏览器
+ *    签名 cookie），因此不是「任何 loopback 页面都能 POST 一把」的裸路由。
+ * 5. 单价：内置价表在 `./pricing.js`；要接中转站的不同单价，写
+ *    `%DSH_HOME%/.dsh-usage-stats.prices.json` 覆盖（无需改代码/重编译）。
  *
  * 运行时只依赖 node 内置模块 —— DSH 服务一律经 `ctx` 取用，不 import 任何
  * `@deepseek-ai/*` 值（类型导入会被编译期擦除），因此插件在任何 profile 下
- * 都不会因缺依赖而挂起。
+ * 都不会因缺依赖而挂起；`connection` 缺失时鉴权降级为本地 Host/Origin 围栏。
  *
  * @module @dsh-external/dsh-usage-stats
  */
@@ -38,6 +43,7 @@ import {
   type UsageTotals,
 } from './fold.js'
 import { LedgerStore, loadLedger } from './ledger.js'
+import { isPricedModel, parsePriceOverrides, priceOverrideCount, setPriceOverrides } from './pricing.js'
 
 /** Cordis 插件名。 */
 export const name = '@dsh-external/dsh-usage-stats'
@@ -53,6 +59,17 @@ const API_PREFIX = '/dsh-usage-stats/api'
 
 /** 账本文件名（放在 DSH_HOME 下，node_modules 可能只读或被清理）。 */
 const LEDGER_FILE = '.dsh-usage-stats.json'
+
+/**
+ * 单价覆盖文件名（与账本同目录）。
+ *
+ * 官方名之外的中转别名、或与官方不同价的渠道，写这个文件即可，不必改代码重编译。
+ * 形状见 {@link parsePriceOverrides}。
+ */
+const PRICE_FILE = '.dsh-usage-stats.prices.json'
+
+/** 缺口补齐期间允许缓存的实时事件条数上限（防御异常会话把内存吃光）。 */
+const REPAIR_QUEUE_LIMIT = 20_000
 
 /** 近 N 天趋势的默认窗口。 */
 const DEFAULT_DAYS = 14
@@ -80,12 +97,86 @@ interface HostContext {
 interface HttpRequest {
   url?: string
   method?: string
+  /** 原始请求头。鉴权（Host/Origin 围栏 + 签名 cookie）需要它。 */
+  headers?: Record<string, string | readonly string[] | undefined>
 }
 
 /** 最小 HTTP 响应视图。 */
 interface HttpResponse {
   writeHead(status: number, headers: Record<string, string>): void
   end(body?: string): void
+}
+
+/**
+ * `ctx.connection` 的最小视图（官方 `dsh-client-connection` 的宽松视图）。
+ *
+ * 只取 `requestRejection`：官方文档对该方法的描述正是「把 Connection 的
+ * Host/Origin 检查与浏览器鉴权应用到别的 Web 路由」，即插件路由该用的那一层。
+ * 值不 import，缺失时降级为本地围栏，插件在任何 profile 下都不会因缺依赖挂起。
+ */
+interface ConnectionLike {
+  requestRejection(request: {
+    headers: Record<string, string | readonly string[] | undefined>
+  }): 401 | 403 | undefined
+}
+
+/** 取请求头（大小写不敏感；数组取首值）。 */
+function headerOf(headers: HttpRequest['headers'], name: string): string | undefined {
+  if (headers === undefined) return undefined
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== name) continue
+    if (typeof value === 'string') return value
+    if (Array.isArray(value)) return value[0]
+    return undefined
+  }
+  return undefined
+}
+
+/** Host 头是否指向本机（回环地址 / localhost / IPv6 回环）。 */
+function isLoopbackAuthority(host: string): boolean {
+  let url: URL
+  try {
+    url = new URL(`http://${host}`)
+  } catch {
+    return false
+  }
+  const hostname = url.hostname.toLowerCase()
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1') return true
+  // 整个 127/8 都是回环；DSH 也把部署推导出的局域网 IP 视为可信，这里不猜，交给官方层。
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)
+}
+
+/**
+ * 插件路由的准入判断：优先复用官方鉴权，缺失时降级为本地 Host/Origin 围栏。
+ *
+ * 为什么需要它：`webServer.register` 注册的路由**绕过**了官方 `/api` 通道的
+ * 准入（Host 围栏防 DNS rebinding、Origin/`sec-fetch-site` 防跨站、签名 cookie
+ * 防未登录）。插件自己注册路由就必须自己补上这一层，否则任意 loopback 页面都能
+ * 用 `no-cors` 简单请求触发清空账本这类副作用。
+ * @param connection - `ctx.connection`（缺失时为 undefined）。
+ * @param req - 原始请求。
+ * @returns 拒绝状态码；允许通行时为 undefined。
+ */
+function routeRejection(connection: ConnectionLike | undefined, req: HttpRequest): 401 | 403 | undefined {
+  const headers = req.headers ?? {}
+  if (connection !== undefined && typeof connection.requestRejection === 'function') {
+    try {
+      return connection.requestRejection({ headers })
+    } catch {
+      // 官方层异常时退回本地围栏，绝不放行。
+    }
+  }
+  const host = headerOf(headers, 'host')
+  // 无 Host（HTTP/1.0 或畸形请求）一律拒绝：Host 是 rebinding 唯一伪造不了的字段。
+  if (host === undefined || !isLoopbackAuthority(host)) return 403
+  if (headerOf(headers, 'sec-fetch-site') === 'cross-site') return 403
+  const origin = headerOf(headers, 'origin')
+  if (origin === undefined) return undefined
+  try {
+    return new URL(origin).host === new URL(`http://${host}`).host ? undefined : 403
+  } catch {
+    return 403
+  }
 }
 
 /** 写 JSON 响应。 */
@@ -229,10 +320,20 @@ function summaryView(
     persistenceAvailable: boolean
     ledgerFile: string
     writeError?: string | undefined
+    /** 单价覆盖文件路径（面板用于说明费用口径来自哪里）。 */
+    priceFile: string
+    /** 生效的覆盖规则条数。 */
+    priceOverrides: number
+    /** 覆盖文件读取/解析失败的原因（不阻断统计）。 */
+    priceFileError?: string | undefined
   },
 ): unknown {
   const totalCalls = state.totals.toolCalls
   const detailMissingDays = countDaysMissingDetail(state)
+  // 费用口径的自证：价表未收录的模型当前按基价兜底，金额不可信，必须让用户看见。
+  const unpricedModels = Object.keys(state.models)
+    .filter((model) => !isPricedModel(model))
+    .sort()
   const ranked = Object.entries(state.tools)
     .map(([toolName, stat]) => ({ name: toolName, calls: stat.calls, ms: Math.round(stat.ms) }))
     .sort((left, right) => right.calls - left.calls || right.ms - left.ms)
@@ -278,6 +379,11 @@ function summaryView(
       // 用逐日比对而非「明细表是否为空」，否则升级当天的实时明细会掩盖历史缺失。
       detailMissingDays,
       detailMissing: state.totals.sessions > 0 && detailMissingDays > 0,
+      // 费用可信度：未收录模型按基价兜底，面板据此提示「金额仅供参考」。
+      unpricedModels,
+      priceFile: options.priceFile,
+      priceOverrides: options.priceOverrides,
+      priceFileError: options.priceFileError ?? null,
     },
   }
 }
@@ -310,22 +416,60 @@ export function apply(ctx: HostContext): void {
   if (loaded.notice !== undefined) warn(loaded.notice)
   if (!loaded.loaded) store.touch()
 
+  // ---- 单价覆盖 ---------------------------------------------------------
+  // 与官方不同价的渠道（中转站）不改代码就能接上：读 %DSH_HOME%/.dsh-usage-stats.prices.json。
+  const priceFile = path.join(dshHome, PRICE_FILE)
+  let priceFileError: string | undefined
+  try {
+    if (fs.existsSync(priceFile)) {
+      const parsed = parsePriceOverrides(JSON.parse(fs.readFileSync(priceFile, 'utf8')) as unknown)
+      setPriceOverrides(parsed.rules)
+      if (parsed.problems.length > 0) priceFileError = parsed.problems.join('；')
+      log(`已加载单价覆盖：${parsed.rules.length} 条规则${parsed.problems.length > 0 ? `（跳过 ${parsed.problems.length} 条）` : ''}`)
+    } else {
+      setPriceOverrides([])
+    }
+  } catch (error) {
+    priceFileError = String(error)
+    setPriceOverrides([])
+    warn(`单价覆盖文件解析失败，改用内置价表：${String(error)}`)
+  }
+
   const persistence = ctx.get('sessionPersistence') as PersistenceLike | undefined
+  const connection = ctx.get('connection') as ConnectionLike | undefined
   const deps = { persistence, state: store.state, pending, onProgress: (): void => store.touch(), log: warn }
 
   // ---- 实时链路 ---------------------------------------------------------
-  /** 正在补齐的会话（防止 seq 跳跃反复触发并发读）。 */
-  const catching = new Set<string>()
+  /**
+   * 正在补齐缺口的会话 → 补齐期间到达的实时事件（按序缓存，补齐结束后重放）。
+   *
+   * 为什么必须「先补齐、后折叠」：`applyEvent` 会把游标推过缺口。旧实现先折叠
+   * 再 `catchUp()`，补齐路径从**已经推过的游标**开始读，缺口永远读不回来
+   * （实测：同一份日志全量回填得 62 次工具调用，中途接入只得 8 次）。
+   * 因此缺口会话上不再直接折叠实时事件，而是全部入队；补齐（从原游标续读到
+   * 末尾）结束后按序重放这些事件，`seq < consumedSeq` 的去重保证恰好计一次。
+   */
+  const repairing = new Map<string, Array<{ seq: number; time: number; type: string; data?: unknown }>>()
+  /** 在飞的补齐任务（rebuild 前必须等它们收尾，否则会与清空后的重放互相污染）。 */
+  const repairs = new Set<Promise<unknown>>()
 
-  const catchUp = (sessionId: string): void => {
-    if (persistence === undefined || catching.has(sessionId)) return
-    catching.add(sessionId)
-    void scanSession(deps, sessionId)
+  const startRepair = (sessionId: string): void => {
+    if (persistence === undefined || repairing.has(sessionId)) return
+    repairing.set(sessionId, [])
+    const task = scanSession(deps, sessionId)
       .then((folded) => {
         if (folded > 0) store.touch()
       })
       .catch((error: unknown) => warn(`补齐会话 ${sessionId} 失败：${String(error)}`))
-      .finally(() => catching.delete(sessionId))
+      .finally(() => {
+        const queued = repairing.get(sessionId) ?? []
+        repairing.delete(sessionId)
+        let changed = false
+        for (const event of queued) if (applyEvent(store.state, sessionId, event, pending)) changed = true
+        if (changed) store.touch()
+      })
+    repairs.add(task)
+    void task.finally(() => repairs.delete(task))
   }
 
   ctx.effect(
@@ -336,18 +480,25 @@ export function apply(ctx: HostContext): void {
         const sessionId = session?.id
         if (typeof sessionId !== 'string' || sessionId === '') return
         if (event === undefined || typeof event.type !== 'string') return
+        const foldable = event as { seq: number; time: number; type: string; data?: unknown }
+        // 补齐进行中：只入队，等续读结束后按序重放（绝不先推进游标）。
+        const queue = repairing.get(sessionId)
+        if (queue !== undefined) {
+          if (queue.length < REPAIR_QUEUE_LIMIT) queue.push(foldable)
+          else warn(`会话 ${sessionId} 补齐期间事件过多，已丢弃超出 ${REPAIR_QUEUE_LIMIT} 条的部分`)
+          return
+        }
         // 缺口判断必须在折叠之前：正常情况事件的 seq 恰好等于游标。
         const seq = typeof event.seq === 'number' ? event.seq : -1
         const gapAhead = seq >= 0 && seq > cursorOf(store.state, sessionId).consumedSeq
-        const changed = applyEvent(
-          store.state,
-          sessionId,
-          event as { seq: number; time: number; type: string; data?: unknown },
-          pending,
-        )
+        // 注入发生在会话中途时，游标与实时事件之间存在缺口 —— 先补它，本次事件一并入队。
+        if (gapAhead && persistence !== undefined) {
+          startRepair(sessionId)
+          repairing.get(sessionId)?.push(foldable)
+          return
+        }
+        const changed = applyEvent(store.state, sessionId, foldable, pending)
         if (changed) store.touch()
-        // 注入发生在会话中途时，游标与实时事件之间存在缺口 —— 补齐它。
-        if (gapAhead) catchUp(sessionId)
       }),
     'usage-stats: live session events',
   )
@@ -382,6 +533,8 @@ export function apply(ctx: HostContext): void {
     promise = (async (): Promise<unknown> => {
       if (previous !== undefined) await previous.catch(() => undefined)
       if (options.rebuild) {
+        // 在飞的缺口补齐同样在写账本：先等它们收尾再清空，否则两边互相污染。
+        if (repairs.size > 0) await Promise.allSettled([...repairs])
         resetState(store.state)
         pending.clear()
         store.touch()
@@ -409,7 +562,12 @@ export function apply(ctx: HostContext): void {
   }
 
   // 首次运行全量回填；此后只补账本里没有的新会话（增量、秒级完成）。
-  const first = loaded.state.backfill.done !== true || loaded.state.backfill.scanned === 0
+  //
+  // 判据只看 `done`：早先还带了 `scanned === 0`，而**增量扫描扫到 0 个新会话时会把
+  // scanned 写成 0**，于是每次重载都被误判成「首次运行」，把全部会话重读一遍
+  // （游标续读，数字不会错，但会话多时纯属白读盘）。`done` 为 false 时（全新账本、
+  // 账本损坏重建、persistence 曾经不可用）才走全量；此时 `onlyMissing` 也覆盖一切。
+  const first = loaded.state.backfill.done !== true
   setTimeout(() => {
     void requestScan({ onlyMissing: !first, rebuild: false }).promise
   }, 0).unref?.()
@@ -440,6 +598,13 @@ export function apply(ctx: HostContext): void {
         handler: (req: HttpRequest, res: HttpResponse): void => {
           void (async (): Promise<void> => {
             try {
+              // 先过准入：插件路由绕过了官方 /api 通道，必须自己补上 Host/Origin
+              // 围栏与浏览器鉴权，否则任意 loopback 页面都能 no-cors 触发 /rescan。
+              const rejection = routeRejection(connection, req)
+              if (rejection !== undefined) {
+                sendJson(res, rejection, { ok: false, error: rejection === 401 ? '未通过浏览器鉴权' : '请求来源不被信任' })
+                return
+              }
               const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
               const route = url.pathname.startsWith(API_PREFIX) ? url.pathname.slice(API_PREFIX.length) : url.pathname
               if (route === '' || route === '/' || route === '/summary') {
@@ -458,6 +623,9 @@ export function apply(ctx: HostContext): void {
                     persistenceAvailable: persistence !== undefined,
                     ledgerFile,
                     writeError: store.lastError,
+                    priceFile,
+                    priceOverrides: priceOverrideCount(),
+                    priceFileError,
                   }),
                 )
                 return
@@ -505,9 +673,15 @@ export function apply(ctx: HostContext): void {
       store.flush()
       store.dispose()
       pending.clear()
+      repairing.clear()
+      titleCache.clear()
     },
     'usage-stats: flush ledger on dispose',
   )
 
-  log(`已加载（账本：${ledgerFile}，历史回填：${first ? '全量' : '增量'}，持久化服务：${persistence === undefined ? '不可用' : '可用'}）`)
+  log(
+    `已加载（账本：${ledgerFile}，历史回填：${first ? '全量' : '增量'}，持久化服务：` +
+      `${persistence === undefined ? '不可用' : '可用'}，路由鉴权：${connection === undefined ? '本地围栏（未找到 connection 服务）' : '官方 connection'}，` +
+      `单价覆盖：${priceOverrideCount()} 条）`,
+  )
 }

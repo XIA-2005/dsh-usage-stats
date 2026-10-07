@@ -27,6 +27,15 @@ import { createBars, createDonut, type Bar, type BarsController, type DonutContr
 import { fmtCost, fmtDateTime, fmtDuration, fmtInt, fmtPercent, fmtTokens } from './format.js'
 import { STYLES, paletteColor } from './styles.js'
 
+/**
+ * client 侧服务注入声明。
+ *
+ * 缺了它本模块的 fiber 不注入任何服务，`ctx.slots` 为 undefined，
+ * `apply()` 里 `ctx.slots.inject(...)` 会抛 TypeError，前端整页报
+ * `web boot: 1 entry did not activate / @dsh-external/dsh-usage-stats: failed`。
+ */
+export const inject = ['slots']
+
 /** host API 前缀（与 src/index.ts 的 API_PREFIX 一致）。 */
 const API = '/dsh-usage-stats/api'
 
@@ -134,6 +143,14 @@ interface Summary {
     updatedAt: number
     sessionCount: number
     detailMissing: boolean
+    /** 价表未收录（当前按基价兜底、金额不可信）的模型名。 */
+    unpricedModels: string[]
+    /** 单价覆盖文件路径。 */
+    priceFile: string
+    /** 生效的覆盖规则条数。 */
+    priceOverrides: number
+    /** 覆盖文件读取/解析失败的原因。 */
+    priceFileError: string | null
   }
 }
 
@@ -417,7 +434,15 @@ function UsagePage(): unknown {
 
     const loadSummary = async (): Promise<void> => {
       try {
-        const response = await fetch(summaryUrl(), { headers: { accept: 'application/json' } })
+        // credentials 必须显式给：插件路由走官方鉴权（签名 cookie），漏带就 401。
+        const response = await fetch(summaryUrl(), {
+          headers: { accept: 'application/json' },
+          credentials: 'same-origin',
+        })
+        if (response.status === 401 || response.status === 403) {
+          status.textContent = `插件接口拒绝了本次请求（HTTP ${response.status}）：请从带 token 的地址打开 DSH 并刷新页面。`
+          return
+        }
         const data = (await response.json()) as Summary
         if (disposed) return
         if (data.ok !== true) {
@@ -438,7 +463,14 @@ function UsagePage(): unknown {
       if (!force && key === detailsKey && Date.now() - lastDetailAt < DETAIL_TTL_MS) return
       const [from, to] = key.split('..')
       try {
-        const response = await fetch(`${API}/days?from=${from}&to=${to}`, { headers: { accept: 'application/json' } })
+        const response = await fetch(`${API}/days?from=${from}&to=${to}`, {
+          headers: { accept: 'application/json' },
+          credentials: 'same-origin',
+        })
+        if (response.status === 401 || response.status === 403) {
+          detailError = `接口拒绝（HTTP ${response.status}）：请刷新页面重新登录`
+          return
+        }
         const data = (await response.json()) as { ok?: boolean; days?: DayDetail[] }
         if (disposed) return
         if (data.ok !== true) {
@@ -824,19 +856,41 @@ function UsagePage(): unknown {
               : ''
       const time = summary === null ? '' : ` · 更新于 ${new Date(summary.generatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
       status.textContent = `${meta?.persistenceAvailable === true ? '持久化服务可用' : '持久化服务不可用（仅统计本次启动）'}${progress}${time}`
-      status.title = meta === undefined ? '' : `账本：${meta.ledgerFile}`
+      status.title =
+        meta === undefined
+          ? ''
+          : [
+              `账本：${meta.ledgerFile}`,
+              typeof meta.priceOverrides === 'number' && meta.priceOverrides > 0
+                ? `单价覆盖：${meta.priceFile}（${meta.priceOverrides} 条生效）`
+                : `单价表：内置${typeof meta.priceFile === 'string' ? `（可用 ${meta.priceFile} 覆盖）` : ''}`,
+            ].join('\n')
 
       const messages: string[] = []
+      const hints: string[] = []
       if (meta?.persistenceAvailable === false) messages.push('未找到会话持久化服务，历史回填不可用。')
       if (meta !== undefined && meta.writeError !== null) messages.push(`账本写入失败（统计仅在内存中）：${meta.writeError}`)
       if (backfill !== undefined && backfill.errors > 0) messages.push(`${backfill.errors} 个会话读取失败，已跳过。`)
       if (detailError !== '') messages.push(`按天明细刷新失败：${detailError}`)
       if (meta?.detailMissing === true) {
-        warn.textContent = `${messages.join(' ')} 按天明细缺失（升级后新增维度，历史不会自动补算）—— 点「重建统计」补全。`.trim()
-        warn.style.display = 'block'
-        return
+        messages.push('按天明细缺失（升级后新增维度，历史不会自动补算）。')
+        hints.push('点「重建统计」补全')
       }
-      warn.textContent = messages.join(' ')
+      // 以下字段缺失时按「无事」处理：热重载期间可能出现新 client + 旧 host 的组合。
+      if (typeof meta?.priceFileError === 'string') {
+        messages.push(`单价覆盖文件不可用（已改用内置价表）：${meta.priceFileError}`)
+        hints.push(`检查 ${meta.priceFile}`)
+      }
+      // 费用可信度：未收录的模型按基价兜底，金额可能差很多，必须显式提示而不是静默。
+      const unpriced = Array.isArray(meta?.unpricedModels) ? meta.unpricedModels : []
+      if (unpriced.length > 0) {
+        const shown = unpriced.slice(0, 4).join(' / ')
+        messages.push(
+          `费用仅供参考：${unpriced.length} 个模型未收录价表，按基价兜底（${shown}${unpriced.length > 4 ? ' 等' : ''}）。`,
+        )
+        hints.push(`在 ${meta?.priceFile ?? '单价覆盖文件'} 里补单价后点「重建统计」`)
+      }
+      warn.textContent = [messages.join(' '), hints.length > 0 ? `—— ${hints.join('；')}。` : ''].join('').trim()
       warn.style.display = messages.length > 0 ? 'block' : 'none'
     }
 
@@ -858,8 +912,16 @@ function UsagePage(): unknown {
     const scan = (button: HTMLButtonElement, label: string, rebuild: boolean): void => {
       button.disabled = true
       button.textContent = '扫描中…'
-      void fetch(`${API}/rescan${rebuild ? '?rebuild=1' : ''}`, { method: 'POST' })
-        .then((response) => response.json())
+      void fetch(`${API}/rescan${rebuild ? '?rebuild=1' : ''}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      })
+        .then((response) => {
+          if (response.status === 401 || response.status === 403) {
+            throw new Error(`接口拒绝（HTTP ${response.status}）：请刷新页面重新登录`)
+          }
+          return response.json()
+        })
         .then(() => {
           if (rebuild) {
             details.clear()

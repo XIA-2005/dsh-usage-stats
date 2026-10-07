@@ -1,4 +1,9 @@
 node_modules/
-lib/
 *.tsbuildinfo
 *.tgz
+
+# lib/ 是**有意提交**的构建产物：分享给同学的是 GitHub 仓库，clone 下来直接
+# `dev_inject_plugin`/install_bundle 就能用，不需要 DSH 源码检出、npm 安装或
+# 任何构建步骤（对方机器上 git/registry 未必通）。改完源码请跑 npm run build
+# 并把 lib/ 一起提交，否则仓库里跑的是旧代码。
+!lib/
