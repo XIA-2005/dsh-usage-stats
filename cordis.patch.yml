@@ -1,0 +1,18 @@
+# ============================================================================
+# dsh-usage-stats —— profile bundle patch（插件的「挂载声明」）
+# ============================================================================
+# DSH 启动时按 bundle 层叠加各插件的 patch，本文件把用量统计插件插入 profile
+# 的配置树。有了它，安装就不需要手改 profile 的 cordis.patch.yml。
+#
+# 依赖 profile/package.json 里两处声明同时存在：
+#   1. dependencies 里有本包（link:/file:/github: 均可）；
+#   2. dsh.profile.bundles 里有本包名。
+# 两条官方安装命令都会自动补这两处：
+#   dsh plugin --profile <profile> add link:<本目录绝对路径>
+#   plugin_manager install_bundle <本目录绝对路径>      # DSH 会话内的插件管理器
+# 只有 (1) 而没有 (2) 时，DSH 会把它当普通依赖（警告 declares no dsh.bundle）。
+# ============================================================================
+
+- insert:
+    - id: usage-stats
+      name: '@dsh-external/dsh-usage-stats'
