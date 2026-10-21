@@ -234,6 +234,7 @@ function UsagePage(): unknown {
     const details = new Map<string, DayDetail>()
     let detailsKey = ''
     let lastDetailAt = 0
+    let detailLoaded = false
     let detailError = ''
     let summary: Summary | null = null
     let disposed = false
@@ -346,6 +347,7 @@ function UsagePage(): unknown {
         selectedDate = null
         details.clear()
         detailsKey = ''
+        detailLoaded = false
         paintRangeButtons()
         void loadDetails(true).then(() => paint())
         void loadSummary()
@@ -481,6 +483,7 @@ function UsagePage(): unknown {
         for (const day of data.days ?? []) details.set(day.date, day)
         detailsKey = key
         lastDetailAt = Date.now()
+        detailLoaded = true
         detailError = ''
       } catch (error) {
         detailError = String(error)
@@ -788,6 +791,7 @@ function UsagePage(): unknown {
     }
 
     const paintPie = (): void => {
+      const all = allSlices()
       const slices = currentSlices()
       const off = hidden.get(pieMode)
       for (const [key, button] of modeButtons) button.classList.toggle('on', key === pieMode)
@@ -803,13 +807,16 @@ function UsagePage(): unknown {
       donut.update(slices, pieMode === 'tokens' ? '合计' : '当前视角', fmtTokens(slices.reduce((sum, slice) => sum + slice.value, 0)))
       paintPieCenter()
       legend.textContent = ''
-      if (slices.length === 0) {
-        const loading = detailError === '' && details.size === 0
+      if (all.length === 0) {
+        // 明细还没回来时才是「加载中」；已加载但为空，或全部被图例隐藏，都不是加载态
+        const loading = pieMode !== 'tokens' && detailError === '' && !detailLoaded
         legend.append(el('li', 'dus-empty', loading ? '明细加载中…' : '当前视角暂无数据'))
         return
       }
-      for (const slice of slices) {
-        const item = el('li', off?.has(slice.key) === true ? 'off' : undefined)
+      // 图例始终列出全部切片：被隐藏的项留在原地变暗，才能再点回来
+      for (const slice of all) {
+        const isOff = off?.has(slice.key) === true
+        const item = el('li', isOff ? 'off' : undefined)
         const swatch = el('span', 'sw')
         swatch.style.background = slice.color
         const name = el('span', 'nm', slice.label)
@@ -832,6 +839,7 @@ function UsagePage(): unknown {
         })
         legend.append(item)
       }
+      if (slices.length === 0) legend.append(el('li', 'dus-empty', '已隐藏全部项，点上方任一项恢复'))
     }
 
     /** 环心默认文本（hover 时由回调临时覆盖）。 */
@@ -926,6 +934,7 @@ function UsagePage(): unknown {
           if (rebuild) {
             details.clear()
             detailsKey = ''
+            detailLoaded = false
             selectedDate = null
           }
           return loadSummary().then(() => loadDetails(true)).then(() => paint())
